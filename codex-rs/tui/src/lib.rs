@@ -5,10 +5,12 @@
 #![deny(clippy::disallowed_methods)]
 use app::App;
 pub use app::AppExitInfo;
+use chrono::Utc;
 use codex_app_server_protocol::AuthMode;
 use codex_core::AuthManager;
 use codex_core::BUILT_IN_OSS_MODEL_PROVIDER_ID;
 use codex_core::CodexAuth;
+use codex_core::REQUEST_LOG_DIR_ENV;
 use codex_core::RolloutRecorder;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -24,6 +26,7 @@ use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use tracing::error;
+use tracing::info;
 use tracing_appender::non_blocking;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -282,6 +285,13 @@ async fn run_ratatui_app(
     let mut config = config;
     color_eyre::install()?;
 
+    if cli.log_to_disk {
+        match enable_request_logging_dir(&config) {
+            Ok(path) => info!(path = %path.display(), "request logging enabled"),
+            Err(err) => error!("failed to enable request logging: {err}"),
+        };
+    }
+
     // Forward panic reports through tracing so they appear in the UI status
     // line, but do not swallow the default/color-eyre panic handler.
     // Chain to the previous hook so users still get a rich panic report
@@ -435,6 +445,18 @@ async fn run_ratatui_app(
     session_log::log_session_end();
     // ignore error when collecting usage – report underlying error instead
     app_result
+}
+
+fn enable_request_logging_dir(config: &Config) -> std::io::Result<PathBuf> {
+    let mut base = codex_core::config::log_dir(config)?;
+    base.push("request-dumps");
+    std::fs::create_dir_all(&base)?;
+
+    let timestamp = Utc::now().format("session-%Y%m%dT%H%M%S%.3fZ");
+    let dir = base.join(timestamp.to_string());
+    std::fs::create_dir_all(&dir)?;
+    std::env::set_var(REQUEST_LOG_DIR_ENV, &dir);
+    Ok(dir)
 }
 
 #[expect(

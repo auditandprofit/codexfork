@@ -224,8 +224,7 @@ mod tests {
 
     #[test]
     fn drops_from_last_user_only() {
-        let items = vec![
-            user_msg("u1"),
+        let items = [user_msg("u1"),
             assistant_msg("a1"),
             assistant_msg("a2"),
             user_msg("u2"),
@@ -244,8 +243,7 @@ mod tests {
                 arguments: "{}".to_string(),
                 call_id: "c1".to_string(),
             },
-            assistant_msg("a4"),
-        ];
+            assistant_msg("a4")];
 
         // Wrap as InitialHistory::Forked with response items only.
         let initial: Vec<RolloutItem> = items

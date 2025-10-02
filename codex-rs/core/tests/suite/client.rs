@@ -686,6 +686,7 @@ async fn azure_responses_request_includes_store_and_reasoning_ids() {
         effort,
         summary,
         conversation_id,
+        None,
     );
 
     let mut prompt = Prompt::default();

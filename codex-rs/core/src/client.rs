@@ -45,6 +45,8 @@ use crate::openai_tools::create_tools_json_for_responses_api;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::RateLimitWindow;
 use crate::protocol::TokenUsage;
+use crate::request_logging::RequestAttemptLogger;
+use crate::request_logging::RequestLogger;
 use crate::token_data::PlanType;
 use crate::util::backoff;
 use codex_otel::otel_event_manager::OtelEventManager;
@@ -80,6 +82,7 @@ pub struct ModelClient {
     conversation_id: ConversationId,
     effort: Option<ReasoningEffortConfig>,
     summary: ReasoningSummaryConfig,
+    request_logger: Option<Arc<RequestLogger>>,
 }
 
 impl ModelClient {
@@ -91,6 +94,7 @@ impl ModelClient {
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         conversation_id: ConversationId,
+        request_logger: Option<Arc<RequestLogger>>,
     ) -> Self {
         let client = create_client();
 
@@ -103,6 +107,7 @@ impl ModelClient {
             conversation_id,
             effort,
             summary,
+            request_logger,
         }
     }
 
@@ -132,6 +137,7 @@ impl ModelClient {
                     &self.client,
                     &self.provider,
                     &self.otel_event_manager,
+                    self.request_logger.clone(),
                 )
                 .await?;
 
@@ -275,11 +281,13 @@ impl ModelClient {
         // Always fetch the latest auth in case a prior attempt refreshed the token.
         let auth = auth_manager.as_ref().and_then(|m| m.auth());
 
-        trace!(
-            "POST to {}: {:?}",
-            self.provider.get_full_url(&auth),
-            serde_json::to_string(payload_json)
-        );
+        let url = self.provider.get_full_url(&auth);
+        trace!("POST to {}: {:?}", url, serde_json::to_string(payload_json));
+
+        let attempt_logger = self
+            .request_logger
+            .as_ref()
+            .and_then(|logger| logger.log_request(attempt, &url, payload_json));
 
         let mut req_builder = self
             .provider
@@ -331,6 +339,10 @@ impl ModelClient {
                     debug!("receiver dropped rate limit snapshot event");
                 }
 
+                if let Some(logger) = attempt_logger.as_ref() {
+                    logger.log_response_start(resp.status(), resp.headers());
+                }
+
                 // spawn task to process SSE
                 let stream = resp.bytes_stream().map_err(CodexErr::Reqwest);
                 tokio::spawn(process_sse(
@@ -338,6 +350,7 @@ impl ModelClient {
                     tx_event,
                     self.provider.stream_idle_timeout(),
                     self.otel_event_manager.clone(),
+                    attempt_logger.clone(),
                 ));
 
                 Ok(ResponseStream { rx_event })
@@ -367,20 +380,28 @@ impl ModelClient {
                 // exact error message (e.g. "Unknown parameter: 'input[0].metadata'"). The body is
                 // small and this branch only runs on error paths so the extra allocation is
                 // negligible.
+                let headers = res.headers().clone();
+                let body = res.text().await.unwrap_or_default();
+
                 if !(status == StatusCode::TOO_MANY_REQUESTS
                     || status == StatusCode::UNAUTHORIZED
                     || status.is_server_error())
                 {
-                    // Surface the error body to callers. Use `unwrap_or_default` per Clippy.
-                    let body = res.text().await.unwrap_or_default();
+                    if let Some(logger) = attempt_logger {
+                        logger.log_error_response(status, &body);
+                    }
                     return Err(StreamAttemptError::Fatal(CodexErr::UnexpectedStatus(
                         status, body,
                     )));
                 }
 
+                if let Some(logger) = attempt_logger {
+                    logger.log_error_response(status, &body);
+                }
+
                 if status == StatusCode::TOO_MANY_REQUESTS {
-                    let rate_limit_snapshot = parse_rate_limit_snapshot(res.headers());
-                    let body = res.json::<ErrorResponse>().await.ok();
+                    let rate_limit_snapshot = parse_rate_limit_snapshot(&headers);
+                    let body = serde_json::from_str::<ErrorResponse>(&body).ok();
                     if let Some(ErrorResponse { error }) = body {
                         if error.r#type.as_deref() == Some("usage_limit_reached") {
                             // Prefer the plan_type provided in the error message if present
@@ -407,7 +428,12 @@ impl ModelClient {
                     retry_after,
                 })
             }
-            Err(e) => Err(StreamAttemptError::RetryableTransportError(e.into())),
+            Err(e) => {
+                if let Some(logger) = attempt_logger {
+                    logger.log_error(&format!("request error: {e}"));
+                }
+                Err(StreamAttemptError::RetryableTransportError(e.into()))
+            }
         }
     }
 
@@ -441,6 +467,10 @@ impl ModelClient {
 
     pub fn get_auth_manager(&self) -> Option<Arc<AuthManager>> {
         self.auth_manager.clone()
+    }
+
+    pub fn get_request_logger(&self) -> Option<Arc<RequestLogger>> {
+        self.request_logger.clone()
     }
 }
 
@@ -626,10 +656,12 @@ async fn process_sse<S>(
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     idle_timeout: Duration,
     otel_event_manager: OtelEventManager,
+    request_logger: Option<RequestAttemptLogger>,
 ) where
     S: Stream<Item = Result<Bytes>> + Unpin,
 {
     let mut stream = stream.eventsource();
+    let request_logger = request_logger;
 
     // If the stream stays completely silent for an extended period treat it as disconnected.
     // The response id returned from the "complete" message.
@@ -641,14 +673,30 @@ async fn process_sse<S>(
             .log_sse_event(|| timeout(idle_timeout, stream.next()))
             .await
         {
-            Ok(Some(Ok(sse))) => sse,
+            Ok(Some(Ok(sse))) => {
+                if let Some(logger) = request_logger.as_ref() {
+                    let event_name = if sse.event.is_empty() {
+                        None
+                    } else {
+                        Some(sse.event.as_str())
+                    };
+                    logger.log_stream_event(event_name, &sse.data);
+                }
+                sse
+            }
             Ok(Some(Err(e))) => {
+                if let Some(logger) = request_logger.as_ref() {
+                    logger.log_error(&format!("sse error: {e}"));
+                }
                 debug!("SSE Error: {e:#}");
                 let event = CodexErr::Stream(e.to_string(), None);
                 let _ = tx_event.send(Err(event)).await;
                 return;
             }
             Ok(None) => {
+                if let Some(logger) = request_logger.as_ref() {
+                    logger.log_stream_closed("stream_end");
+                }
                 match response_completed {
                     Some(ResponseCompleted {
                         id: response_id,
@@ -688,6 +736,9 @@ async fn process_sse<S>(
                 return;
             }
             Err(_) => {
+                if let Some(logger) = request_logger.as_ref() {
+                    logger.log_stream_closed("idle_timeout");
+                }
                 let _ = tx_event
                     .send(Err(CodexErr::Stream(
                         "idle timeout waiting for SSE".into(),
@@ -871,6 +922,7 @@ async fn stream_from_fixture(
         tx_event,
         provider.stream_idle_timeout(),
         otel_event_manager,
+        None,
     ));
     Ok(ResponseStream { rx_event })
 }
@@ -941,6 +993,7 @@ mod tests {
             tx,
             provider.stream_idle_timeout(),
             otel_event_manager,
+            None,
         ));
 
         let mut events = Vec::new();
@@ -977,6 +1030,7 @@ mod tests {
             tx,
             provider.stream_idle_timeout(),
             otel_event_manager,
+            None,
         ));
 
         let mut out = Vec::new();
