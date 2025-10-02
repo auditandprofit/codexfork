@@ -8,6 +8,8 @@ use crate::error::CodexErr;
 use crate::error::Result;
 use crate::model_family::ModelFamily;
 use crate::openai_tools::create_tools_json_for_chat_completions_api;
+use crate::request_logging::RequestAttemptLogger;
+use crate::request_logging::RequestLogger;
 use crate::util::backoff;
 use bytes::Bytes;
 use codex_otel::otel_event_manager::OtelEventManager;
@@ -21,6 +23,7 @@ use futures::TryStreamExt;
 use reqwest::StatusCode;
 use serde_json::json;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
@@ -35,6 +38,7 @@ pub(crate) async fn stream_chat_completions(
     client: &reqwest::Client,
     provider: &ModelProviderInfo,
     otel_event_manager: &OtelEventManager,
+    request_logger: Option<Arc<RequestLogger>>,
 ) -> Result<ResponseStream> {
     if prompt.output_schema.is_some() {
         return Err(CodexErr::UnsupportedOperation(
@@ -282,9 +286,10 @@ pub(crate) async fn stream_chat_completions(
         "tools": tools_json,
     });
 
+    let url = provider.get_full_url(&None);
     debug!(
         "POST to {}: {}",
-        provider.get_full_url(&None),
+        url,
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     );
 
@@ -292,6 +297,10 @@ pub(crate) async fn stream_chat_completions(
     let max_retries = provider.request_max_retries();
     loop {
         attempt += 1;
+
+        let attempt_logger = request_logger
+            .as_ref()
+            .and_then(|logger| logger.log_request(attempt, &url, &payload));
 
         let req_builder = provider.create_request_builder(client, &None).await?;
 
@@ -307,19 +316,29 @@ pub(crate) async fn stream_chat_completions(
         match res {
             Ok(resp) if resp.status().is_success() => {
                 let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
+                if let Some(logger) = attempt_logger.as_ref() {
+                    logger.log_response_start(resp.status(), resp.headers());
+                }
                 let stream = resp.bytes_stream().map_err(CodexErr::Reqwest);
                 tokio::spawn(process_chat_sse(
                     stream,
                     tx_event,
                     provider.stream_idle_timeout(),
                     otel_event_manager.clone(),
+                    attempt_logger.clone(),
                 ));
                 return Ok(ResponseStream { rx_event });
             }
             Ok(res) => {
                 let status = res.status();
+                let headers = res.headers().clone();
+                let body = res.text().await.unwrap_or_default();
+
+                if let Some(logger) = attempt_logger {
+                    logger.log_error_response(status, &body);
+                }
+
                 if !(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
-                    let body = (res.text().await).unwrap_or_default();
                     return Err(CodexErr::UnexpectedStatus(status, body));
                 }
 
@@ -327,8 +346,7 @@ pub(crate) async fn stream_chat_completions(
                     return Err(CodexErr::RetryLimit(status));
                 }
 
-                let retry_after_secs = res
-                    .headers()
+                let retry_after_secs = headers
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok());
@@ -339,6 +357,9 @@ pub(crate) async fn stream_chat_completions(
                 tokio::time::sleep(delay).await;
             }
             Err(e) => {
+                if let Some(logger) = attempt_logger {
+                    logger.log_error(&format!("request error: {e}"));
+                }
                 if attempt > max_retries {
                     return Err(e.into());
                 }
@@ -357,10 +378,12 @@ async fn process_chat_sse<S>(
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
     idle_timeout: Duration,
     otel_event_manager: OtelEventManager,
+    request_logger: Option<RequestAttemptLogger>,
 ) where
     S: Stream<Item = Result<Bytes>> + Unpin,
 {
     let mut stream = stream.eventsource();
+    let request_logger = request_logger;
 
     // State to accumulate a function call across streaming chunks.
     // OpenAI may split the `arguments` string over multiple `delta` events
@@ -384,14 +407,30 @@ async fn process_chat_sse<S>(
             .log_sse_event(|| timeout(idle_timeout, stream.next()))
             .await
         {
-            Ok(Some(Ok(ev))) => ev,
+            Ok(Some(Ok(ev))) => {
+                if let Some(logger) = request_logger.as_ref() {
+                    let event_name = if ev.event.is_empty() {
+                        None
+                    } else {
+                        Some(ev.event.as_str())
+                    };
+                    logger.log_stream_event(event_name, &ev.data);
+                }
+                ev
+            }
             Ok(Some(Err(e))) => {
+                if let Some(logger) = request_logger.as_ref() {
+                    logger.log_error(&format!("sse error: {e}"));
+                }
                 let _ = tx_event
                     .send(Err(CodexErr::Stream(e.to_string(), None)))
                     .await;
                 return;
             }
             Ok(None) => {
+                if let Some(logger) = request_logger.as_ref() {
+                    logger.log_stream_closed("stream_end");
+                }
                 // Stream closed gracefully – emit Completed with dummy id.
                 let _ = tx_event
                     .send(Ok(ResponseEvent::Completed {
@@ -402,6 +441,9 @@ async fn process_chat_sse<S>(
                 return;
             }
             Err(_) => {
+                if let Some(logger) = request_logger.as_ref() {
+                    logger.log_stream_closed("idle_timeout");
+                }
                 let _ = tx_event
                     .send(Err(CodexErr::Stream(
                         "idle timeout waiting for SSE".into(),

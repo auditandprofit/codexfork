@@ -72,6 +72,10 @@ pub struct Cli {
     #[arg(long = "search", default_value_t = false)]
     pub web_search: bool,
 
+    /// Write raw model requests and responses to disk for debugging.
+    #[arg(long = "log-to-disk", default_value_t = false)]
+    pub log_to_disk: bool,
+
     #[clap(skip)]
     pub config_overrides: CliConfigOverrides,
 }

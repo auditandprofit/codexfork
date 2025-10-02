@@ -9,6 +9,7 @@ use crate::AuthManager;
 use crate::client_common::REVIEW_PROMPT;
 use crate::event_mapping::map_response_item_to_event_messages;
 use crate::function_tool::FunctionCallError;
+use crate::request_logging::RequestLogger;
 use crate::review_format::format_review_findings_block;
 use crate::terminal;
 use crate::user_notification::UserNotifier;
@@ -421,6 +422,8 @@ impl Session {
             }
         }
 
+        let request_logger = RequestLogger::from_env(&conversation_id);
+
         let otel_event_manager = OtelEventManager::new(
             conversation_id,
             config.model.as_str(),
@@ -454,6 +457,7 @@ impl Session {
             model_reasoning_effort,
             model_reasoning_summary,
             conversation_id,
+            request_logger.clone(),
         );
         let turn_context = TurnContext {
             client,
@@ -1143,6 +1147,8 @@ async fn submission_loop(
                     updated_config.model_family.slug.as_str(),
                 );
 
+                let request_logger = prev.client.get_request_logger();
+
                 let client = ModelClient::new(
                     Arc::new(updated_config),
                     auth_manager,
@@ -1151,6 +1157,7 @@ async fn submission_loop(
                     effective_effort,
                     effective_summary,
                     sess.conversation_id,
+                    request_logger,
                 );
 
                 let new_approval_policy = approval_policy.unwrap_or(prev.approval_policy);
@@ -1247,6 +1254,8 @@ async fn submission_loop(
                             per_turn_config.model_family.slug.as_str(),
                         );
 
+                    let request_logger = turn_context.client.get_request_logger();
+
                     // Build a new client with per‑turn reasoning settings.
                     // Reuse the same provider and session id; auth defaults to env/API key.
                     let client = ModelClient::new(
@@ -1257,6 +1266,7 @@ async fn submission_loop(
                         effort,
                         summary,
                         sess.conversation_id,
+                        request_logger,
                     );
 
                     let fresh_turn_context = TurnContext {
@@ -1528,6 +1538,8 @@ async fn spawn_review_thread(
             per_turn_config.model_family.slug.as_str(),
         );
 
+    let request_logger = parent_turn_context.client.get_request_logger();
+
     let per_turn_config = Arc::new(per_turn_config);
     let client = ModelClient::new(
         per_turn_config.clone(),
@@ -1537,6 +1549,7 @@ async fn spawn_review_thread(
         per_turn_config.model_reasoning_effort,
         per_turn_config.model_reasoning_summary,
         sess.conversation_id,
+        request_logger,
     );
 
     let review_turn_context = TurnContext {
@@ -3266,6 +3279,7 @@ mod tests {
         let config = Arc::new(config);
         let conversation_id = ConversationId::default();
         let otel_event_manager = otel_event_manager(conversation_id, config.as_ref());
+        let request_logger = RequestLogger::from_env(&conversation_id);
         let client = ModelClient::new(
             config.clone(),
             None,
@@ -3274,6 +3288,7 @@ mod tests {
             config.model_reasoning_effort,
             config.model_reasoning_summary,
             conversation_id,
+            request_logger,
         );
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_family: &config.model_family,
@@ -3339,6 +3354,7 @@ mod tests {
         let config = Arc::new(config);
         let conversation_id = ConversationId::default();
         let otel_event_manager = otel_event_manager(conversation_id, config.as_ref());
+        let request_logger = RequestLogger::from_env(&conversation_id);
         let client = ModelClient::new(
             config.clone(),
             None,
@@ -3347,6 +3363,7 @@ mod tests {
             config.model_reasoning_effort,
             config.model_reasoning_summary,
             conversation_id,
+            request_logger,
         );
         let tools_config = ToolsConfig::new(&ToolsConfigParams {
             model_family: &config.model_family,
